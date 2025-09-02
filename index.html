@@ -9,7 +9,7 @@
             margin: 0;
             overflow: hidden;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background-color: #1a1a1a;
+            background-color: #000000;
             color: white;
         }
         canvas {
@@ -82,19 +82,29 @@
         {
             "imports": {
                 "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+                "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
             }
         }
     </script>
 
     <script type="module">
         import * as THREE from 'three';
+        import * as CANNON from 'cannon-es';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { OutlinePass } from 'three/addons/postprocessing/OutlinePass.js';
+
+        // Add custom toon gradient texture
+        const gradientMap = new THREE.TextureLoader().load('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAABCAYAAAD5PA/NAAAAFElEQVQIW2NkYGD4z8DAwMgABQAFNgECzEGHnQAAAABJRU5ErkJggg==');
+        gradientMap.minFilter = THREE.NearestFilter;
+        gradientMap.magFilter = THREE.NearestFilter;
 
         // Basic Scene Setup
         const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x1a1a1a);
+        scene.background = new THREE.Color(0x000000);
 
         const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
         camera.position.set(0, 2, 5);
@@ -107,14 +117,53 @@
         renderer.setPixelRatio(window.devicePixelRatio);
         document.body.appendChild(renderer.domElement);
 
+        // Add Effect Composer setup after renderer initialization
+        const composer = new EffectComposer(renderer);
+        const renderPass = new RenderPass(scene, camera);
+        composer.addPass(renderPass);
+
+        // Create outline pass
+        const outlinePass = new OutlinePass(
+            new THREE.Vector2(window.innerWidth, window.innerHeight),
+            scene,
+            camera
+        );
+        outlinePass.edgeStrength = 3.0;
+        outlinePass.edgeGlow = 0.0;
+        outlinePass.edgeThickness = 1.0;
+        outlinePass.visibleEdgeColor.set('#ffffff');
+        outlinePass.hiddenEdgeColor.set('#190a05');
+        composer.addPass(outlinePass);
+
         // Enhanced Lighting
-        const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x444444, 2.0);
+        const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
         hemisphereLight.position.set(0, 20, 0);
         scene.add(hemisphereLight);
 
-        const mainDirectionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        const mainDirectionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
         mainDirectionalLight.position.set(5, 10, 7.5);
         scene.add(mainDirectionalLight);
+
+        // Physics World Setup
+        const world = new CANNON.World({
+            gravity: new CANNON.Vec3(0, -9.82, 0)
+        });
+        world.allowSleep = true; // Allow bodies to sleep
+        world.broadphase = new CANNON.SAPBroadphase(world); // Use SAPBroadphase for better performance and stability
+        world.solver.iterations = 10;
+
+        // Ground physics body
+        const groundBody = new CANNON.Body({
+            type: CANNON.Body.STATIC,
+            shape: new CANNON.Plane()
+        });
+        groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+        world.addBody(groundBody);
+
+        // Keep track of physics bodies
+        let physicsBodies = [];
+        // Keep track of meshes with physics
+        let physicsMeshes = [];
 
         // Controls
         const controls = new OrbitControls(camera, renderer.domElement);
@@ -127,12 +176,12 @@
         controls.update();
 
         // Grid Helper with fixed rendering
-        const gridHelper = new THREE.GridHelper(10, 10, 0x888888, 0x444444);
+        const gridHelper = new THREE.GridHelper(10, 10, 0xffffff, 0xffffff);
         gridHelper.renderOrder = -1;
         const gridMaterial = gridHelper.material;
         gridMaterial.depthWrite = false;
         gridMaterial.transparent = true;
-        gridMaterial.opacity = 0.5;
+        gridMaterial.opacity = 0.7; // Increased opacity for better visibility
         gridMaterial.polygonOffset = true;
         gridMaterial.polygonOffsetFactor = -1;
         gridMaterial.polygonOffsetUnits = -1;
@@ -145,50 +194,126 @@
         const fileInput = document.getElementById('model-input');
 
         function loadModel(url, fileName) {
+            // Clear previous model's meshes from the scene
+            physicsMeshes.forEach(mesh => {
+                scene.remove(mesh);
+                if (mesh.geometry) mesh.geometry.dispose();
+                if (mesh.material) {
+                    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                    materials.forEach(m => m.dispose());
+                }
+            });
+
             if (currentModel) {
                 scene.remove(currentModel);
             }
+            // Remove old physics bodies and meshes
+            physicsBodies.forEach(body => world.removeBody(body));
+            physicsBodies = [];
+            physicsMeshes = [];
             document.getElementById('error-log').style.display = 'none';
 
             loader.load(url,
                 function (gltf) {
                     console.log(`Model '${fileName}' loaded successfully:`, gltf);
-                    currentModel = gltf.scene;
+                    
+                    // Add model to scene to calculate world positions
+                    scene.add(gltf.scene);
+                    gltf.scene.updateMatrixWorld(true);
 
-                    // Force Opaque Materials
-                    currentModel.traverse((child) => {
-                        if (child.isMesh && child.material) {
-                            const materials = Array.isArray(child.material) ? child.material : [child.material];
-                            materials.forEach(material => {
-                                material.transparent = false;
-                                material.opacity = 1.0;
-                                material.depthWrite = true;
-                                material.depthTest = true;
-                                material.needsUpdate = true;
+                    const selectedObjects = [];
+                    
+                    gltf.scene.traverse((child) => {
+                        if (child.isMesh) {
+                            selectedObjects.push(child);
+                            
+                            // --- Physics Body Creation ---
+                            const position = new THREE.Vector3();
+                            const quaternion = new THREE.Quaternion();
+                            const scale = new THREE.Vector3();
+                            
+                            // 1. Get the mesh's world transform
+                            child.updateMatrixWorld(true);
+                            child.matrixWorld.decompose(position, quaternion, scale);
+
+                            // 2. Calculate the world-space center of the mesh's geometry
+                            child.geometry.computeBoundingBox();
+                            const center = child.geometry.boundingBox.getCenter(new THREE.Vector3());
+                            center.applyMatrix4(child.matrixWorld); // Transform center to world space
+
+                            // 3. Now, center the actual geometry data
+                            child.geometry.center();
+
+                            // 4. Calculate the size for the physics shape
+                            const size = new THREE.Vector3();
+                            child.geometry.boundingBox.getSize(size);
+                            size.multiply(scale);
+
+                            const shape = new CANNON.Box(new CANNON.Vec3(size.x / 2, size.y / 2, size.z / 2));
+                            
+                            const body = new CANNON.Body({
+                                mass: size.x * size.y * size.z, // Mass proportional to volume
+                                position: new CANNON.Vec3().copy(center), // Use the calculated world center
+                                quaternion: new CANNON.Quaternion().copy(quaternion),
+                                shape: shape,
+                                linearDamping: 0.01, 
+                                angularDamping: 0.01,
+                                allowSleep: true,
+                                sleepSpeedLimit: 0.1, // Body will sleep if its speed is below this value
+                                sleepTimeLimit: 1, // Body will sleep after 1s of being slow
                             });
+
+                            body.sleep(); // Start the body in a sleeping state
+                            world.addBody(body);
+                            physicsBodies.push(body);
+                            
+                            // Link mesh and body
+                            child.userData.physicsBody = body;
+                            physicsMeshes.push(child);
+
+                            // --- Material Setup ---
+                            if (child.material) {
+                                const materials = Array.isArray(child.material) ? child.material : [child.material];
+                                materials.forEach(originalMaterial => {
+                                    const toonMaterial = new THREE.MeshToonMaterial({
+                                        color: originalMaterial.color || 0x808080,
+                                        gradientMap: gradientMap,
+                                        transparent: false,
+                                        opacity: 1.0,
+                                        depthWrite: true,
+                                        depthTest: true
+                                    });
+                                    
+                                    if (originalMaterial.map) {
+                                        toonMaterial.map = originalMaterial.map;
+                                    }
+                                    child.material = toonMaterial;
+                                });
+                            }
                         }
                     });
-
-                    // Model Positioning and Camera Targeting
-                    const box = new THREE.Box3().setFromObject(currentModel);
-                    const size = box.getSize(new THREE.Vector3());
-                    const center = box.getCenter(new THREE.Vector3());
-
-                    currentModel.position.x -= center.x;
-                    currentModel.position.z -= center.z;
-                    currentModel.position.y = -box.min.y + 0.01;
                     
-                    scene.add(currentModel);
+                    // Detach children from parent and add directly to scene
+                    // This is necessary for individual physics updates
+                    while(gltf.scene.children.length > 0) {
+                        const child = gltf.scene.children[0];
+                        // The mesh's geometry is now centered, so its position should match the physics body
+                        scene.add(child);
+                    }
+                    scene.remove(gltf.scene);
+                    currentModel = null; 
 
-                    const modelHeight = size.y;
-                    controls.target.set(
-                        currentModel.position.x, 
-                        modelHeight / 2, 
-                        currentModel.position.z
-                    );
+                    outlinePass.selectedObjects = selectedObjects;
+
+                    // Set initial camera target
+                    if (physicsMeshes.length > 0) {
+                        const box = new THREE.Box3().setFromObject(physicsMeshes[0]);
+                        const center = box.getCenter(new THREE.Vector3());
+                        controls.target.copy(center);
+                    }
                     controls.update();
 
-                    infoP.innerHTML = `Showing: <strong>${fileName}</strong>. Use your mouse to interact.`;
+                    infoP.innerHTML = `Showing: <strong>${fileName}</strong>. Click to shoot.`;
                 },
                 function (xhr) {
                     const percentLoaded = Math.round((xhr.loaded / xhr.total) * 100);
@@ -218,11 +343,72 @@
             loadModel(objectURL, file.name);
         });
 
-        // Animation Loop
+        // Interaction: Shoot a sphere on click using raycasting
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        window.addEventListener('click', (event) => {
+            // Prevent firing when clicking on UI elements
+            if (document.querySelector('#info-box').contains(event.target)) {
+                return;
+            }
+
+            // Convert mouse click to normalized device coordinates
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = - (event.clientY / window.innerHeight) * 2 + 1;
+
+            // Update the picking ray with the camera and mouse position
+            raycaster.setFromCamera(mouse, camera);
+
+            // Create the projectile
+            const sphereShape = new CANNON.Sphere(0.2);
+            const sphereBody = new CANNON.Body({ mass: 5, shape: sphereShape });
+            
+            // Set projectile position and velocity
+            const camPos = camera.position;
+            const direction = raycaster.ray.direction;
+
+            sphereBody.position.copy(camPos);
+            sphereBody.velocity.copy(direction).scale(50, sphereBody.velocity);
+            
+            // Make sure the projectile doesn't sleep
+            sphereBody.allowSleep = false;
+            world.addBody(sphereBody);
+
+            // Optional: visualize the projectile
+            const sphereGeo = new THREE.SphereGeometry(0.2);
+            const sphereMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+            const sphereMesh = new THREE.Mesh(sphereGeo, sphereMat);
+            sphereMesh.userData.physicsBody = sphereBody;
+            scene.add(sphereMesh);
+            physicsMeshes.push(sphereMesh);
+
+            // Remove projectile after a while
+            setTimeout(() => {
+                world.removeBody(sphereBody);
+                scene.remove(sphereMesh);
+                physicsMeshes = physicsMeshes.filter(m => m !== sphereMesh);
+            }, 2000);
+        });
+
+        // Update animation loop to include physics
+        const timeStep = 1 / 60;
         function animate() {
             requestAnimationFrame(animate);
+            
+            world.step(timeStep);
+
+            // Update all physics-enabled meshes
+            for (const mesh of physicsMeshes) {
+                if (mesh.userData.physicsBody) {
+                    const body = mesh.userData.physicsBody;
+                    // The mesh's parent (the scene) is now the reference for position/rotation
+                    mesh.position.copy(body.position);
+                    mesh.quaternion.copy(body.quaternion);
+                }
+            }
+
             controls.update();
-            renderer.render(scene, camera);
+            composer.render();
         }
 
         // Handle Window Resize
@@ -230,6 +416,7 @@
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
         }, false);
 
         animate();
