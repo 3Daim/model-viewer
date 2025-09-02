@@ -35,6 +35,26 @@
             font-size: 0.9em;
             line-height: 1.4;
         }
+        #mass-control, #projectile-size-control, #bg-color-control {
+            margin-top: 15px;
+        }
+        #mass-control label, #projectile-size-control label, #bg-color-control label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 0.9em;
+        }
+        #mass-control input, #projectile-size-control input, #bg-color-control input {
+            width: 100%;
+            box-sizing: border-box;
+        }
+        #bg-color-control input[type="color"] {
+            height: 30px;
+            padding: 2px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 5px;
+            cursor: pointer;
+            background: transparent;
+        }
         #error-log {
             position: absolute;
             bottom: 20px;
@@ -71,6 +91,18 @@
         <p>No model loaded. Use the button to select a .glb file.</p>
         <input type="file" id="model-input" accept=".glb" style="display: none;" />
         <label for="model-input" class="file-btn">Load Model</label>
+        <div id="mass-control">
+            <label id="mass-label" for="mass-slider">Mass Multiplier: 1.0</label>
+            <input type="range" id="mass-slider" min="0.1" max="10" step="0.1" value="1">
+        </div>
+        <div id="projectile-size-control">
+            <label id="size-label" for="size-slider">Ball Size: 0.2</label>
+            <input type="range" id="size-slider" min="0.1" max="2" step="0.1" value="0.2">
+        </div>
+        <div id="bg-color-control">
+            <label for="bg-color-picker">Background Color</label>
+            <input type="color" id="bg-color-picker" value="#000000">
+        </div>
     </div>
 
     <div id="error-log">
@@ -152,6 +184,19 @@
         world.broadphase = new CANNON.SAPBroadphase(world); // Use SAPBroadphase for better performance and stability
         world.solver.iterations = 10;
 
+        // Physics Materials
+        const blockMaterial = new CANNON.Material('block');
+        const projectileMaterial = new CANNON.Material('projectile');
+        const contactMaterial = new CANNON.ContactMaterial(
+            blockMaterial,
+            projectileMaterial,
+            {
+                restitution: 0.8, // Bounciness
+                friction: 0.1
+            }
+        );
+        world.addContactMaterial(contactMaterial);
+
         // Ground physics body
         const groundBody = new CANNON.Body({
             type: CANNON.Body.STATIC,
@@ -165,6 +210,10 @@
         // Keep track of meshes with physics
         let physicsMeshes = [];
 
+        // Mass adjustment
+        let massMultiplier = 1.0;
+        let projectileRadius = 0.2;
+
         // Controls
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
@@ -176,16 +225,25 @@
         controls.update();
 
         // Grid Helper with fixed rendering
-        const gridHelper = new THREE.GridHelper(10, 10, 0xffffff, 0xffffff);
-        gridHelper.renderOrder = -1;
-        const gridMaterial = gridHelper.material;
-        gridMaterial.depthWrite = false;
-        gridMaterial.transparent = true;
-        gridMaterial.opacity = 0.7; // Increased opacity for better visibility
-        gridMaterial.polygonOffset = true;
-        gridMaterial.polygonOffsetFactor = -1;
-        gridMaterial.polygonOffsetUnits = -1;
-        scene.add(gridHelper);
+        let gridHelper;
+        function createGrid(color) {
+            if (gridHelper) {
+                scene.remove(gridHelper);
+                gridHelper.geometry.dispose();
+                gridHelper.material.dispose();
+            }
+            gridHelper = new THREE.GridHelper(10, 10, color, color);
+            gridHelper.renderOrder = -1;
+            const gridMaterial = gridHelper.material;
+            gridMaterial.depthWrite = false;
+            gridMaterial.transparent = true;
+            gridMaterial.opacity = 0.7;
+            gridMaterial.polygonOffset = true;
+            gridMaterial.polygonOffsetFactor = -1;
+            gridMaterial.polygonOffsetUnits = -1;
+            scene.add(gridHelper);
+        }
+        createGrid(0xffffff); // Initial creation
 
         // GLTF Loader
         const loader = new GLTFLoader();
@@ -251,17 +309,20 @@
 
                             const shape = new CANNON.Box(new CANNON.Vec3(size.x / 2, size.y / 2, size.z / 2));
                             
+                            const baseMass = size.x * size.y * size.z;
                             const body = new CANNON.Body({
-                                mass: size.x * size.y * size.z, // Mass proportional to volume
+                                mass: baseMass * massMultiplier,
                                 position: new CANNON.Vec3().copy(center), // Use the calculated world center
                                 quaternion: new CANNON.Quaternion().copy(quaternion),
                                 shape: shape,
+                                material: blockMaterial, // Assign block material
                                 linearDamping: 0.01, 
                                 angularDamping: 0.01,
                                 allowSleep: true,
                                 sleepSpeedLimit: 0.1, // Body will sleep if its speed is below this value
                                 sleepTimeLimit: 1, // Body will sleep after 1s of being slow
                             });
+                            body.userData = { baseMass: baseMass }; // Store base mass
 
                             body.sleep(); // Start the body in a sleeping state
                             world.addBody(body);
@@ -313,7 +374,7 @@
                     }
                     controls.update();
 
-                    infoP.innerHTML = `Showing: <strong>${fileName}</strong>. Click to shoot.`;
+                    infoP.innerHTML = `Showing: <strong>${fileName}</strong>. Aim and press Space to shoot.`;
                 },
                 function (xhr) {
                     const percentLoaded = Math.round((xhr.loaded / xhr.total) * 100);
@@ -343,25 +404,80 @@
             loadModel(objectURL, file.name);
         });
 
-        // Interaction: Shoot a sphere on click using raycasting
+        // Mass slider logic
+        const massSlider = document.getElementById('mass-slider');
+        const massLabel = document.getElementById('mass-label');
+        massSlider.addEventListener('input', (event) => {
+            massMultiplier = parseFloat(event.target.value);
+            massLabel.textContent = `Mass Multiplier: ${massMultiplier.toFixed(1)}`;
+
+            physicsBodies.forEach(body => {
+                if (body.userData && body.userData.baseMass) {
+                    body.mass = body.userData.baseMass * massMultiplier;
+                    body.updateMassProperties();
+                    body.wakeUp();
+                }
+            });
+        });
+
+        // Projectile size slider logic
+        const sizeSlider = document.getElementById('size-slider');
+        const sizeLabel = document.getElementById('size-label');
+        sizeSlider.addEventListener('input', (event) => {
+            projectileRadius = parseFloat(event.target.value);
+            sizeLabel.textContent = `Ball Size: ${projectileRadius.toFixed(1)}`;
+        });
+
+        // Background color picker logic
+        const bgColorPicker = document.getElementById('bg-color-picker');
+        bgColorPicker.addEventListener('input', (event) => {
+            const newColorHex = event.target.value;
+            document.body.style.backgroundColor = newColorHex;
+            
+            const bgColor = new THREE.Color(newColorHex);
+            scene.background = bgColor;
+
+            const invColor = new THREE.Color(1 - bgColor.r, 1 - bgColor.g, 1 - bgColor.b);
+
+            // Prevent pure black for outline, as it can be invisible with some blending modes
+            if (invColor.r < 0.01 && invColor.g < 0.01 && invColor.b < 0.01) {
+                invColor.setScalar(0.01);
+            }
+
+            const invColorHex = invColor.getHex();
+            createGrid(invColorHex);
+            outlinePass.visibleEdgeColor.set(invColorHex);
+            outlinePass.hiddenEdgeColor.set(invColorHex);
+        });
+
+        // Interaction: Aim with mouse, shoot with Spacebar
         const raycaster = new THREE.Raycaster();
         const mouse = new THREE.Vector2();
-        window.addEventListener('click', (event) => {
-            // Prevent firing when clicking on UI elements
-            if (document.querySelector('#info-box').contains(event.target)) {
+
+        window.addEventListener('mousemove', (event) => {
+            // Convert mouse move to normalized device coordinates for aiming
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = - (event.clientY / window.innerHeight) * 2 + 1;
+        });
+
+        window.addEventListener('keydown', (event) => {
+            if (event.code !== 'Space') return; // Fire only on Spacebar press
+
+            // Prevent firing when typing in an input field, etc.
+            if (document.activeElement !== document.body && document.activeElement !== document.querySelector('canvas')) {
                 return;
             }
 
-            // Convert mouse click to normalized device coordinates
-            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
-            mouse.y = - (event.clientY / window.innerHeight) * 2 + 1;
-
-            // Update the picking ray with the camera and mouse position
+            // Update the picking ray with the camera and last known mouse position
             raycaster.setFromCamera(mouse, camera);
 
             // Create the projectile
-            const sphereShape = new CANNON.Sphere(0.2);
-            const sphereBody = new CANNON.Body({ mass: 5, shape: sphereShape });
+            const sphereShape = new CANNON.Sphere(projectileRadius);
+            const sphereBody = new CANNON.Body({ 
+                mass: 50, // Increased projectile mass from 5 to 50 for more impact
+                shape: sphereShape,
+                material: projectileMaterial // Assign projectile material
+            });
             
             // Set projectile position and velocity
             const camPos = camera.position;
@@ -375,7 +491,7 @@
             world.addBody(sphereBody);
 
             // Optional: visualize the projectile
-            const sphereGeo = new THREE.SphereGeometry(0.2);
+            const sphereGeo = new THREE.SphereGeometry(projectileRadius);
             const sphereMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
             const sphereMesh = new THREE.Mesh(sphereGeo, sphereMat);
             sphereMesh.userData.physicsBody = sphereBody;
